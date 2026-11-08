@@ -1,0 +1,6 @@
+.direnv/
+result
+__pycache__/
+*.pyc
+credentials.json
+*-smtp.json

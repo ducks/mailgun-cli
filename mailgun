@@ -1,0 +1,87 @@
+#!/usr/bin/env nu
+use lib/api.nu *
+
+# Make files written by this process private from creation time.
+umask rwx------ | ignore
+
+def main [] {
+  print 'Mailgun domain and SMTP credential management. Run ./mailgun --help for commands.'
+}
+
+# Store an API key securely after verifying it, or check existing credentials.
+def 'main login' [--check, --region: string = ''] {
+  if $check {
+    let config = (load-config $region)
+    request GET '/v4/domains?limit=1' {} $config.region | ignore
+    return ({ authenticated: true, region: $config.region } | to json --indent 2)
+  }
+  let chosen = if $region == '' { 'us' } else { $region }
+  base-url $chosen | ignore
+  print -e 'Create or find your private API key in the Mailgun dashboard.'
+  let key = (input --suppress-output 'Mailgun API key: ' | str trim)
+  print -e ''
+  if ($key | is-empty) { error make {msg: 'API key is required'} }
+  request GET '/v4/domains?limit=1' {} $chosen $key | ignore
+  let file = (credentials-path)
+  let dir = ($file | path dirname)
+  mkdir $dir
+  ^chmod 700 $dir
+  if ($file | path exists) { error make {msg: 'Credentials file already exists; move it aside before replacing it'} }
+  { api_key: $key, region: $chosen } | to json --indent 2 | save $file
+  ^chmod 600 $file
+  print -e $"Credentials saved to ($file)."
+  { authenticated: true, region: $chosen } | to json --indent 2
+}
+
+# List a page of sending domains (results include total_count).
+def 'main domains list' [--region: string = '', --limit: int = 100, --skip: int = 0] {
+  if $limit < 1 or $limit > 1000 or $skip < 0 { error make {msg: 'Use --limit 1..1000 and a nonnegative --skip'} }
+  request GET $"/v4/domains?limit=($limit)&skip=($skip)" {} $region | show-json $in
+}
+
+# Inspect a sending domain, including DNS records returned by Mailgun.
+def 'main domains show' [domain: string, --region: string = ''] {
+  let name = (valid-domain $domain)
+  request GET $"/v4/domains/($name)" {} $region | show-json $in
+}
+
+# Create a sending domain. This changes the selected Mailgun account.
+def 'main domains create' [domain: string, --region: string = ''] {
+  let name = (valid-domain $domain)
+  request POST '/v4/domains' { name: $name } $region | show-json $in
+}
+
+# Ask Mailgun to recheck the domain's DNS configuration.
+def 'main domains verify' [domain: string, --region: string = ''] {
+  let name = (valid-domain $domain)
+  request PUT $"/v4/domains/($name)/verify" {} $region | show-json $in
+}
+
+# List SMTP credential metadata (not existing passwords).
+def 'main smtp list' [domain: string, --region: string = '', --limit: int = 100, --skip: int = 0] {
+  let name = (valid-domain $domain)
+  if $limit < 1 or $limit > 1000 or $skip < 0 { error make {msg: 'Use --limit 1..1000 and a nonnegative --skip'} }
+  request GET $"/v3/domains/($name)/credentials?limit=($limit)&skip=($skip)" {} $region | show-json $in
+}
+
+# Create an SMTP login and save its generated password privately; never print it.
+def 'main smtp create' [domain: string, login: string, --output: path, --region: string = ''] {
+  let name = (valid-domain $domain)
+  let config = (load-config $region)
+  if ($output | is-empty) { error make {msg: '--output is required for the private credential file'} }
+  if ($output | path exists) { error make {msg: 'Output already exists; refusing to overwrite it'} }
+  if not ($login =~ '^[A-Za-z0-9._+%-]+@[A-Za-z0-9.-]+$') { error make {msg: 'Invalid SMTP login'} }
+  if (($login | split row '@' | last | str lowercase) != $name) { error make {msg: 'SMTP login must belong to the selected domain'} }
+  # OpenSSL obtains cryptographically secure random bytes; no password is sent
+  # through command arguments or displayed. Save before the request so a
+  # network timeout cannot leave a created credential with an unknown secret.
+  let password = (do { ^openssl rand -hex 32 } | str trim)
+  if not ($password =~ '^[0-9a-f]{64}$') { error make {msg: 'Could not generate an SMTP password'} }
+  { domain: $name, login: $login, password: $password, region: $config.region } | to json --indent 2 | save $output
+  ^chmod 600 $output
+  print -e $"Private credential file written to ($output)."
+  let response = try { request POST $"/v3/domains/($name)/credentials" { login: $login, password: $password } $config.region } catch {
+    error make {msg: 'Credential creation failed or its result is unknown. The private file was retained; inspect the account before retrying.'}
+  }
+  { created: true, domain: $name, login: $login, credential_file: ($output | path expand) } | to json --indent 2
+}
